@@ -1,5 +1,6 @@
 mod commands;
 mod result;
+mod server;
 
 
 fn main() -> result::Result {
