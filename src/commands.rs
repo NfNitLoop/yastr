@@ -69,8 +69,7 @@ fn db_init(options: GlobalOptions) -> Result {
                 id BLOB NOT NULL GENERATED ALWAYS AS (unhex(json ->> '$.id')),
                 pubkey BLOB NOT NULL GENERATED ALWAYS AS (unhex(json ->> '$.pubkey')),
                 created_at INTEGER NOT NULL GENERATED ALWAYS AS (json ->> '$.created_at'),
-                created_at_utc TEXT NOT NULL GENERATED ALWAYS AS (datetime(created_at, 'unixepoch')),
-                created_at_local TEXT NOT NULL GENERATED ALWAYS AS (datetime(created_at, 'unixepoch', 'localtime'))
+                created_at_utc TEXT NOT NULL GENERATED ALWAYS AS (datetime(created_at, 'unixepoch'))
             ) STRICT
         "}).execute(&mut conn).await?;
 
