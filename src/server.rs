@@ -80,9 +80,9 @@ impl Connection {
     async fn got_message(self: &Arc<Self>, text: String) {
         let msg: nostr::ClientMessage = match serde_json::from_str(&text) {
             Ok(m) => m,
-            Err(e) => {
+            Err(_) => {
                 debug!("Message from client was invalid.");
-                debug!("TODO: notify the client.");
+                self.notice("Your client sent an invalid message.");
                 return;
             }
         };
@@ -100,30 +100,85 @@ impl Connection {
                 subscription_id,
                 filters,
             } => {
-                self.handle_request(subscription_id, filters);
+                let conn = Arc::clone(self);
+                tokio::spawn(async move {
+                    conn.handle_search(subscription_id, filters).await;
+                });
             }
-            Close(sub_id) => self.close_sub(),
+            Close(sub_id) => self.close_sub(sub_id),
         }
     }
 
-    fn close_sub(&self) {
-        todo!()
+    fn close_sub(&self, _sub_id: nostr::SubscriptionId) {
+        // TODO: When we implement long-running subscriptions,
+        // we'll need to process close messages to end them.
+        // For now, though, subscriptions only exist to answer a REQ
+        // for saved items.
     }
 
-    fn handle_request(
+    /// Handles REQ (search) requests.
+    async fn handle_search(
         self: &Arc<Self>,
         subscription_id: nostr::SubscriptionId,
         filters: Vec<nostr::Filter>,
     ) {
-        self.send_spawn(nostr::RelayMessage::Closed {
-            subscription_id,
-            message: "TODO: implement requests".into(),
-        });
+        // We must always close the send EOSE and CLOSE events.
+        // So, we do that below, and delegate the rest to the inner function.
+        self.handle_search_inner(&subscription_id, filters).await;
+
+        let res = self
+            .send(&RelayMessage::EndOfStoredEvents(subscription_id.clone()))
+            .await;
+        if res.is_err() {
+            return;
+        }
+
+        let _ = self
+            .send(&RelayMessage::Closed {
+                subscription_id,
+                message: "TODO: implement streaming".into(),
+            })
+            .await;
     }
 
-    // note: MUST send an OK(true/false) response to every event we get.
+    /// Handle everything but the EOSE and CLOSE events.
+    async fn handle_search_inner(
+        self: &Arc<Self>,
+        subscription_id: &nostr::SubscriptionId,
+        filters: Vec<nostr::Filter>,
+    ) {
+        if filters.len() > 1 {
+            debug!("got {} filters from client, unsupported.", filters.len());
+            self.notice(
+                "TODO: support multiple filters. Until then, please use separate subscriptions.",
+            );
+            return;
+        }
+
+        let mut events = self.db.search(filters);
+
+        while let Some(event) = events.recv().await {
+            let event = match event {
+                Err(err) => {
+                    debug!("Database error: {err:?}");
+                    return;
+                }
+                Ok(e) => e,
+            };
+
+            let res = self
+                .send(&RelayMessage::event(subscription_id.clone(), event))
+                .await;
+            if res.is_err() {
+                trace!("Couldn't send event. Client closed connection?")
+            }
+        }
+    }
+
     async fn save_event(self: &Arc<Self>, event: Box<nostr::Event>) {
-        // TODO: Check allowed pubkeys.
+        // note: MUST send an OK(true/false) response to every event we get.
+
+        // TODO: Check allowed pubkeys. (probably cached?)
 
         let kind = event.kind();
         if kind.is_ephemeral() || kind.is_job_request() || kind.is_job_result() {
@@ -157,17 +212,21 @@ impl Connection {
         }
     }
 
-    async fn send(&self, msg: &nostr::RelayMessage) -> crate::result::Result<(), ConnectionError> {
+    async fn send(&self, msg: &RelayMessage) -> crate::result::Result<(), ConnectionError> {
         let json = serde_json::to_string(&msg)?;
         let ws_msg = ws::Message::Text(json);
         let mut sender = self.sender.lock().await;
         trace!("sending message: {msg:?}");
-        sender.send(ws_msg).await?;
+        let res = sender.send(ws_msg).await;
+        if let Err(err) = &res {
+            debug!("Error sending message: {msg:?}. Error: {err}");
+        }
+        res?;
         Ok(())
     }
 
     /// Send and don't wait to check errors.
-    fn send_spawn(self: &Arc<Self>, msg: nostr::RelayMessage) {
+    fn send_spawn(self: &Arc<Self>, msg: RelayMessage) {
         let conn = Arc::clone(self);
         tokio::spawn(async move {
             let res = conn.send(&msg).await;
@@ -175,6 +234,10 @@ impl Connection {
                 debug!("Error sending message: {msg:?}");
             }
         });
+    }
+
+    fn notice(self: &Arc<Self>, msg: impl Into<String>) {
+        self.send_spawn(RelayMessage::notice(msg))
     }
 }
 

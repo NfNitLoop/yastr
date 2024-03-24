@@ -1,7 +1,7 @@
 use axum::routing::get;
 use indoc::indoc;
 use std::{net::SocketAddr, path::PathBuf, str::FromStr as _};
-use tracing::{debug, instrument};
+use tracing::debug;
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 use clap::Parser;
@@ -65,8 +65,7 @@ pub fn parse_and_run() -> Result {
 fn init_logging() {
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,serve=trace".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -111,9 +110,11 @@ fn db_init(options: GlobalOptions) -> Result {
         sqlx::query(indoc! {"
             CREATE UNIQUE INDEX event_id ON event(id);
             CREATE INDEX event_kind ON event(kind, created_at);
-            CREATE INDEX event_kind_user ON event(kind, pubkey);
             CREATE INDEX event_created_at ON event(created_at, id);
             CREATE INDEX event_pubkey ON event(pubkey, created_at);
+            -- Useful for finding the latest profile/follow-list, etc:
+            CREATE INDEX event_pubkey_kind ON event(pubkey, kind, created_at);
+            -- TODO: The same for the 'd' tag for a user.
         "})
         .execute(&mut conn)
         .await?;
