@@ -11,8 +11,15 @@ indoc = "2.0.5"
 nostr = "0.29.0"
 serde = "1.0.197"
 serde_json = "1.0.114"
-sqlx = { version = "0.7.4", features = ["sqlite"] }
 thiserror = "1.0.58"
 tokio = { version = "1.36.0", features = ["rt-multi-thread"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+
+
+[dependencies.sqlx]
+# workaround until https://github.com/launchbadge/sqlx/pull/3148 is merged/released:
+version = "0.7.4"
+features = ["sqlite", "runtime-tokio"]
+git = "https://github.com/nfnitloop/sqlx.git"
+branch = "bump-sqlite3"

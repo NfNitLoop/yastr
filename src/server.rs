@@ -1,10 +1,14 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::{
-    extract::{ws, ws::WebSocket, ConnectInfo, WebSocketUpgrade},
+    extract::{
+        ws::{self, WebSocket},
+        ConnectInfo, State, WebSocketUpgrade,
+    },
     response::IntoResponse,
 };
 
+use crate::db::DB;
 use futures::{
     stream::{SplitSink, StreamExt},
     SinkExt as _,
@@ -17,19 +21,20 @@ pub async fn get_root(
     ws: WebSocketUpgrade,
     // user_agent: Option<TypedHeader<headers::UserAgent>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(db): State<DB>,
 ) -> impl IntoResponse {
     // TODO: debug
     debug!("Connection from: {addr}");
 
-    ws.on_upgrade(move |socket| handle_nostr_client(socket))
+    ws.on_upgrade(move |socket| handle_nostr_client(socket, db))
 }
 
-async fn handle_nostr_client(mut socket: axum::extract::ws::WebSocket) {
+async fn handle_nostr_client(socket: WebSocket, db: DB) {
     debug!("Opened web socket");
-    let (mut sender, mut receiver) = socket.split();
+    let (sender, mut receiver) = socket.split();
 
     // TODO: Could pass this in from the handler, w/ connection info, etc.
-    let conn = Connection::new(sender);
+    let conn = Connection::new(sender, db);
 
     while let Some(Ok(msg)) = receiver.next().await {
         trace!("Got message: {msg:#?}");
@@ -41,7 +46,10 @@ async fn handle_nostr_client(mut socket: axum::extract::ws::WebSocket) {
             ws::Message::Ping(_) | ws::Message::Pong(_) => {
                 // do nothing for ping/pong. Axum will auto-respond to pings. (Say docs)
             }
-            ws::Message::Text(text) => conn.got_message(text),
+            ws::Message::Text(text) => {
+                let conn = conn.clone();
+                tokio::spawn(async move { conn.got_message(text).await });
+            }
             ws::Message::Close(_) => {
                 break;
             }
@@ -56,18 +64,20 @@ type WSSender = SplitSink<WebSocket, ws::Message>;
 struct Connection {
     subscriptions: HashMap<SubscriptionID, Subscription>,
     sender: Arc<Mutex<WSSender>>,
+    db: DB,
 }
 
 impl Connection {
-    fn new(sender: WSSender) -> Arc<Self> {
+    fn new(sender: WSSender, db: DB) -> Arc<Self> {
         Self {
             subscriptions: HashMap::new(),
             sender: Arc::new(Mutex::new(sender)),
+            db,
         }
         .into()
     }
 
-    fn got_message(self: &Arc<Self>, text: String) {
+    async fn got_message(self: &Arc<Self>, text: String) {
         let msg: nostr::ClientMessage = match serde_json::from_str(&text) {
             Ok(m) => m,
             Err(e) => {
@@ -82,7 +92,10 @@ impl Connection {
             Auth(_) | Count { .. } | NegClose { .. } | NegOpen { .. } | NegMsg { .. } => {
                 debug!("Unsupported message");
             }
-            Event(event) => self.save_event(event),
+            Event(event) => {
+                let conn = Arc::clone(self);
+                tokio::spawn(async move { conn.save_event(event).await });
+            }
             Req {
                 subscription_id,
                 filters,
@@ -108,12 +121,40 @@ impl Connection {
         });
     }
 
-    fn save_event(self: &Arc<Self>, event: Box<nostr::Event>) {
-        self.send_spawn(RelayMessage::ok(
-            event.id,
-            false,
-            "TODO: Implement message saving.",
-        ));
+    // note: MUST send an OK(true/false) response to every event we get.
+    async fn save_event(self: &Arc<Self>, event: Box<nostr::Event>) {
+        // TODO: Check allowed pubkeys.
+
+        let kind = event.kind();
+        if kind.is_ephemeral() || kind.is_job_request() || kind.is_job_result() {
+            self.send_spawn(RelayMessage::ok(
+                event.id,
+                false,
+                "error: Unsuppored event kind.",
+            ));
+            return;
+        }
+
+        if event.verify().is_err() {
+            self.send_spawn(RelayMessage::ok(event.id, false, "Invalid signature"));
+            return;
+        }
+
+        let response = match self.db.save_event(&event).await {
+            Ok(_) => RelayMessage::ok(event.id, true, ""),
+            Err(sqlx::Error::Database(err))
+                if err.kind() == sqlx::error::ErrorKind::UniqueViolation =>
+            {
+                debug!("database error: {err:#?}");
+                RelayMessage::ok(event.id, true, "duplicate: duplicate event")
+            }
+            Err(err) => RelayMessage::ok(event.id, false, err.to_string()),
+        };
+        let res = self.send(&response).await;
+        if res.is_err() {
+            // This is probably always going to be because we lost a connection:
+            trace!("save_event couldn't send response: {res:?}")
+        }
     }
 
     async fn send(&self, msg: &nostr::RelayMessage) -> crate::result::Result<(), ConnectionError> {
@@ -152,6 +193,7 @@ struct SubscriptionID {
     id: Arc<String>,
 }
 
+// TODO: impl DROP.
 struct Subscription {
     id: SubscriptionID,
     sender: Arc<Mutex<SplitSink<WebSocket, ws::Message>>>,

@@ -1,6 +1,7 @@
 use axum::routing::get;
 use indoc::indoc;
 use std::{net::SocketAddr, path::PathBuf, str::FromStr as _};
+use tracing::{debug, instrument};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 use clap::Parser;
@@ -10,8 +11,8 @@ use sqlx::{
 };
 use tokio::runtime::Runtime;
 
-use crate::result::Result;
 use crate::server;
+use crate::{db::DB, result::Result};
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -24,10 +25,12 @@ pub enum Command {
 }
 
 #[derive(Parser, Debug)]
-struct ServeCommand {
-    /// Should we open the browser to the URL we're serving?
-    #[arg(long)]
-    open: bool,
+pub struct ServeCommand {
+    // /// Should we open the browser to the URL we're serving?
+    // #[arg(long)]
+    // open: bool,
+    #[command(flatten)]
+    global: GlobalOptions,
 }
 
 #[derive(Parser, Debug)]
@@ -46,8 +49,8 @@ pub enum DbCommand {
 
 pub fn parse_and_run() -> Result {
     let cmd = Command::parse();
-    // TODO: add debug logging:
-    // println!("{cmd:?}");
+    init_logging();
+    debug!("Parsed command: {cmd:?}");
 
     match cmd {
         Command::Db {
@@ -57,6 +60,16 @@ pub fn parse_and_run() -> Result {
         },
         Command::Serve(serve_cmd) => serve(serve_cmd),
     }
+}
+
+fn init_logging() {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,serve=trace".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 }
 
 fn db_init(options: GlobalOptions) -> Result {
@@ -78,10 +91,14 @@ fn db_init(options: GlobalOptions) -> Result {
             .connect()
             .await?;
 
+        // let exec = |sql: &'static str| async { sqlx::query(sql).execute(&mut conn) };
+
+        debug!("create table");
         sqlx::query(indoc! {"
             CREATE TABLE event(
-                json TEXT NOT NULL,
+                json BLOB NOT NULL,
                 id BLOB NOT NULL GENERATED ALWAYS AS (unhex(json ->> '$.id')),
+                kind INT NOT NULL GENERATED ALWAYS AS (json ->> '$.kind'),
                 pubkey BLOB NOT NULL GENERATED ALWAYS AS (unhex(json ->> '$.pubkey')),
                 created_at INTEGER NOT NULL GENERATED ALWAYS AS (json ->> '$.created_at'),
                 created_at_utc TEXT NOT NULL GENERATED ALWAYS AS (datetime(created_at, 'unixepoch'))
@@ -90,10 +107,33 @@ fn db_init(options: GlobalOptions) -> Result {
         .execute(&mut conn)
         .await?;
 
+        debug!("create indexes");
         sqlx::query(indoc! {"
             CREATE UNIQUE INDEX event_id ON event(id);
+            CREATE INDEX event_kind ON event(kind, created_at);
+            CREATE INDEX event_kind_user ON event(kind, pubkey);
             CREATE INDEX event_created_at ON event(created_at, id);
             CREATE INDEX event_pubkey ON event(pubkey, created_at);
+        "})
+        .execute(&mut conn)
+        .await?;
+
+        debug!("create view");
+        sqlx::query(indoc! {"
+            -- event_view: a more human-readable version of the events table. (except for raw_id)
+            CREATE VIEW event_view AS
+            SELECT
+                id AS raw_id, -- to easily join w/ events table.
+                (json ->> '$.id') AS id,
+                kind,
+                (json ->> '$.pubkey') AS pubkey,
+                (json ->> '$.sig') AS signature,
+                created_at,
+                created_at_utc,
+                (datetime(created_at, 'unixepoch', 'localtime')) AS created_at_local,
+                json(json) AS json
+            FROM event
+            ORDER BY created_at DESC
         "})
         .execute(&mut conn)
         .await?;
@@ -109,15 +149,10 @@ fn serve(opts: ServeCommand) -> Result {
 }
 
 async fn async_serve(opts: ServeCommand) -> Result {
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,serve=trace".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
-    let app = axum::Router::new().route("/", get(server::get_root));
+    let db_pool = DB::connect(&opts.global.db_file).await?;
+    let app = axum::Router::new()
+        .route("/", get(server::get_root))
+        .with_state(db_pool);
 
     // todo:
     let bind = "127.0.0.1:8095";
