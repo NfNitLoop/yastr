@@ -1,0 +1,2 @@
+# Windows reads LF just fine, why does it keep CRLFing all the things? :cry:
+newline_style = "unix"
