@@ -5,8 +5,12 @@ use axum::{
         ws::{self, WebSocket},
         ConnectInfo, State, WebSocketUpgrade,
     },
+    http::{HeaderMap, Response},
     response::IntoResponse,
+    Json,
 };
+use axum_extra::{headers, TypedHeader};
+use serde::Serialize;
 
 use crate::db::DB;
 use futures::{
@@ -18,15 +22,41 @@ use tokio::sync::Mutex;
 use tracing::{debug, trace};
 
 pub async fn get_root(
-    ws: WebSocketUpgrade,
-    // user_agent: Option<TypedHeader<headers::UserAgent>>,
+    ws: Option<WebSocketUpgrade>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(db): State<DB>,
 ) -> impl IntoResponse {
-    // TODO: debug
     debug!("Connection from: {addr}");
 
-    ws.on_upgrade(move |socket| handle_nostr_client(socket, db))
+    if let Some(ws) = ws {
+        return ws.on_upgrade(move |socket| handle_nostr_client(socket, db));
+    }
+
+    Json(RelayInfo::default()).into_response()
+}
+
+/// NIP-11: Serve a Relay Info Document
+/// See: <https://github.com/nostr-protocol/nips/blob/master/11.md>
+#[derive(Debug, Serialize)]
+struct RelayInfo {
+    name: Option<String>,
+    supported_nips: Vec<u32>,
+    software: Option<String>,
+    version: Option<String>,
+}
+
+impl Default for RelayInfo {
+    fn default() -> Self {
+        Self {
+            name: Some("Yastr Relay".into()),
+            software: Some("https://github.com/NfNitLoop/yastr".into()),
+            version: Some(env!("CARGO_PKG_VERSION").into()),
+            supported_nips: vec![
+                1,
+                // 45 // TODO: COUNT.
+            ],
+        }
+    }
 }
 
 async fn handle_nostr_client(socket: WebSocket, db: DB) {
@@ -185,7 +215,7 @@ impl Connection {
             self.send_spawn(RelayMessage::ok(
                 event.id,
                 false,
-                "error: Unsuppored event kind.",
+                format!("error: Unsupported event kind: {}", event.kind),
             ));
             return;
         }
