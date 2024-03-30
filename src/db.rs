@@ -1,12 +1,13 @@
 use futures::StreamExt;
 use indoc::indoc;
 use nostr::JsonUtil;
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{path::Path, str::FromStr, sync::Arc, time::Duration};
 use tokio::sync::mpsc::{Receiver, Sender};
+use tracing::debug;
 
 use sqlx::{
     sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
-    Pool, Sqlite,
+    ConnectOptions as _, Pool, Sqlite,
 };
 
 /// The interface to our underlying database.
@@ -16,6 +17,190 @@ pub(crate) struct DB {
 }
 
 impl DB {
+    pub async fn init(db_file: &str) -> Result<(), sqlx::Error> {
+        let mut conn = SqliteConnectOptions::from_str(db_file)?
+            .journal_mode(SqliteJournalMode::Wal)
+            .create_if_missing(true)
+            .connect()
+            .await?;
+
+        debug!("create table");
+        sqlx::query(indoc! {"
+            CREATE TABLE event(
+                jsonb BLOB NOT NULL
+                , id TEXT NOT NULL AS (jsonb ->> '$.id')
+                , kind INT NOT NULL AS (jsonb ->> '$.kind')
+                , pubkey TEXT NOT NULL AS (jsonb ->> '$.pubkey')
+                , signature TEXT NOT NULL AS (jsonb ->> '$.sig')
+                , content TEXT NOT NULL AS (jsonb ->> '$.content')
+                , created_at INTEGER NOT NULL AS (jsonb ->> '$.created_at')
+                , created_at_utc TEXT NOT NULL AS (datetime(created_at, 'unixepoch'))
+                , json TEXT NOT NULL AS (json(jsonb))
+            ) STRICT
+        "})
+        .execute(&mut conn)
+        .await?;
+
+        debug!("create indexes");
+        sqlx::query(indoc! {"
+            CREATE UNIQUE INDEX event_id ON event(unhex(id)); -- Using unhex to save on index size.
+            CREATE INDEX event_kind ON event(kind, created_at);
+            CREATE INDEX event_created_at ON event(created_at, unhex(id));
+            CREATE INDEX event_pubkey ON event(unhex(pubkey), created_at DESC);
+            CREATE INDEX event_pubkey_kind ON event(unhex(pubkey), kind, created_at DESC); -- Useful for finding the latest profile/follow-list, etc
+        "})
+        .execute(&mut conn)
+        .await?;
+
+        sqlx::query(indoc! {"
+            CREATE VIEW tag_view AS
+            SELECT
+                e.id AS event_id
+                , t.value ->> '$[0]' AS name
+                , t.value ->> '$[1]' AS value
+                , t.value ->> '$[2]' AS value2
+                , t.value ->> '$[2]' AS value3
+                , t.id AS json_id
+            FROM
+                event AS e
+                , json_each(jsonb, '$.tags') AS t
+            ORDER BY 
+                unhex(event_id)
+                , json_id
+            ;
+        "})
+        .execute(&mut conn)
+        .await?;
+
+        sqlx::query(indoc! {"
+            CREATE TABLE tag( -- 'materialized view' of event tags
+                event_id BLOB NOT NULL
+                , name TEXT NOT NULL
+                , value TEXT NOT NULL
+            );
+            CREATE INDEX tag_event ON tag(event_id);
+            CREATE INDEX tag_name_value ON tag(name, value);
+        "})
+        .execute(&mut conn)
+        .await?;
+
+        sqlx::query(indoc! {"
+            CREATE TRIGGER event_tags AFTER INSERT ON event
+            BEGIN
+                INSERT INTO tag(event_id, name, value)
+                SELECT unhex(t.event_id), name, value
+                FROM tag_view AS t
+                WHERE unhex(t.event_id) = unhex(new.id)
+                AND length(t.name) = 1;
+            END;
+            
+            CREATE TRIGGER event_tags_delete AFTER DELETE ON event
+            BEGIN
+                DELETE FROM tag WHERE event_id = unhex(old.id);
+            END;
+        "})
+        .execute(&mut conn)
+        .await?;
+
+        sqlx::query(indoc! {"
+            CREATE VIEW event_latest_kind AS
+            WITH k AS (
+                SELECT
+                    e.pubkey
+                    , e.kind
+                    , e.id AS event_id
+                    , row_number() OVER (
+                        PARTITION BY unhex(e.pubkey), e.kind 
+                        ORDER BY unhex(e.pubkey), e.kind, created_at DESC
+                    ) AS row_number
+                FROM event AS e
+            )
+            SELECT
+                pubkey, kind, event_id
+            FROM k
+            WHERE row_number = 1;
+        "})
+        .execute(&mut conn)
+        .await?;
+
+        sqlx::query(indoc! {"
+            CREATE VIEW profile_info AS
+            SELECT
+                elk.pubkey
+                , e.content ->> '$.name' AS name
+                , e.content ->> '$.display_name' AS display_name
+                , e.content ->> '$.username' AS username
+                , e.content ->> '$.nip05' AS nip05
+                , e.content ->> '$.about' AS about
+            FROM
+                event_latest_kind AS elk
+                JOIN event AS e ON (unhex(e.id) = unhex(elk.event_id))
+            WHERE
+                elk.kind = 0;
+            SELECT * from profile_info;
+        "})
+        .execute(&mut conn)
+        .await?;
+
+        sqlx::query(indoc! {"
+            CREATE VIEW follows AS
+            SELECT
+                elk.pubkey AS follower
+                , t.value AS followed
+            FROM
+                event_latest_kind AS elk
+                JOIN tag AS t ON (t.event_id = unhex(elk.event_id) AND t.name = 'p')
+            WHERE elk.kind = 3;
+        "})
+        .execute(&mut conn)
+        .await?;
+
+        sqlx::query(indoc! {"
+            CREATE VIEW follows_named AS
+            SELECT
+                follower
+                , pi1.name AS follower_name
+                , followed
+                , pi2.name AS followed_name
+            FROM
+                follows AS f
+                -- JOIN event AS e ON (unhex(e.id) = unhex(elk.event_id))
+                LEFT JOIN profile_info AS pi1 ON (unhex(pi1.pubkey) = unhex(follower))
+                LEFT JOIN profile_info AS pi2 ON (unhex(pi2.pubkey) = unhex(followed))
+            ;
+        "})
+        .execute(&mut conn)
+        .await?;
+
+        sqlx::query(indoc! {"
+            CREATE TABLE allow_users(
+                pubkey TEXT NOT NULL
+                , note TEXT DEFAULT NULL
+                , allowed_levels INTEGER NOT NULL DEFAULT 1
+            )
+        "})
+        .execute(&mut conn)
+        .await?;
+
+        sqlx::query(indoc! {"
+            CREATE VIEW allowed_users AS
+            WITH RECURSIVE
+                au(pubkey, level) AS (
+                    SELECT pubkey, allowed_levels FROM allow_users
+                    UNION
+                    SELECT followed, au.level - 1
+                    FROM au
+                    JOIN follows ON (unhex(au.pubkey) = unhex(follows.follower))
+                    WHERE au.level > 0
+                )
+            select * from au;
+        "})
+        .execute(&mut conn)
+        .await?;
+
+        Ok(())
+    }
+
     /// Create a DB pool, and also open an initial connection to test it.
     pub async fn connect(db_file: &Path) -> Result<Self, sqlx::Error> {
         let pool = SqlitePoolOptions::new()
@@ -40,7 +225,7 @@ impl DB {
     /// Note: Assumes you've already validated the event.
     pub async fn save_event(&self, event: &nostr::Event) -> Result<(), sqlx::Error> {
         let query = sqlx::query(indoc! {"
-            INSERT INTO event(json)
+            INSERT INTO event(jsonb)
             VALUES (jsonb(?))
         "})
         .bind(event.as_json());
@@ -66,7 +251,7 @@ impl DB {
         filters: Vec<nostr::Filter>,
         sender: Sender<Result<nostr::Event, sqlx::Error>>,
     ) {
-        let mut query = sqlx::QueryBuilder::new("SELECT json(json) AS json FROM event WHERE true");
+        let mut query = sqlx::QueryBuilder::new("SELECT json FROM event WHERE true");
 
         if let Some(filter) = filters.first() {
             let nostr::Filter {
@@ -82,7 +267,7 @@ impl DB {
             if let Some(authors) = authors {
                 if !authors.is_empty() {
                     let mut query = query.separated(",");
-                    query.push_unseparated(" AND pubkey IN (");
+                    query.push_unseparated(" AND unhex(pubkey) IN (");
                     for pubkey in authors {
                         let key = pubkey.to_bytes().to_vec();
                         query.push_bind(key);
@@ -104,7 +289,7 @@ impl DB {
             if let Some(ids) = ids {
                 if !ids.is_empty() {
                     let mut query = query.separated(",");
-                    query.push_unseparated(" AND id IN (");
+                    query.push_unseparated(" AND unhex(id) IN (");
                     for id in ids {
                         query.push_bind(id.as_bytes().to_vec());
                     }

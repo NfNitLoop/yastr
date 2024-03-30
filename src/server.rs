@@ -1,15 +1,13 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     extract::{
         ws::{self, WebSocket},
         ConnectInfo, State, WebSocketUpgrade,
     },
-    http::{HeaderMap, Response},
     response::IntoResponse,
     Json,
 };
-use axum_extra::{headers, TypedHeader};
 use serde::Serialize;
 
 use crate::db::DB;
@@ -92,7 +90,7 @@ type WSSender = SplitSink<WebSocket, ws::Message>;
 
 /// State for a nostr connection.
 struct Connection {
-    subscriptions: HashMap<SubscriptionID, Subscription>,
+    // subscriptions: HashMap<SubscriptionID, Subscription>,
     sender: Arc<Mutex<WSSender>>,
     db: DB,
 }
@@ -100,7 +98,6 @@ struct Connection {
 impl Connection {
     fn new(sender: WSSender, db: DB) -> Arc<Self> {
         Self {
-            subscriptions: HashMap::new(),
             sender: Arc::new(Mutex::new(sender)),
             db,
         }
@@ -284,10 +281,4 @@ pub enum ConnectionError {
 #[derive(Debug, PartialEq)]
 struct SubscriptionID {
     id: Arc<String>,
-}
-
-// TODO: impl DROP.
-struct Subscription {
-    id: SubscriptionID,
-    sender: Arc<Mutex<SplitSink<WebSocket, ws::Message>>>,
 }

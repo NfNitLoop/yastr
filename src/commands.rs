@@ -1,14 +1,10 @@
 use axum::routing::get;
-use indoc::indoc;
-use std::{net::SocketAddr, path::PathBuf, str::FromStr as _};
+
+use std::{net::SocketAddr, path::PathBuf};
 use tracing::debug;
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 use clap::Parser;
-use sqlx::{
-    sqlite::{SqliteConnectOptions, SqliteJournalMode},
-    ConnectOptions as _,
-};
 use tokio::runtime::Runtime;
 
 use crate::server;
@@ -83,64 +79,8 @@ fn db_init(options: GlobalOptions) -> Result {
 
     Runtime::new().unwrap().block_on(async move {
         println!("Initializing {}...", db_file);
-
-        let mut conn = SqliteConnectOptions::from_str(db_file)?
-            .journal_mode(SqliteJournalMode::Wal)
-            .create_if_missing(true)
-            .connect()
-            .await?;
-
-        // let exec = |sql: &'static str| async { sqlx::query(sql).execute(&mut conn) };
-
-        debug!("create table");
-        sqlx::query(indoc! {"
-            CREATE TABLE event(
-                json BLOB NOT NULL,
-                id BLOB NOT NULL GENERATED ALWAYS AS (unhex(json ->> '$.id')),
-                kind INT NOT NULL GENERATED ALWAYS AS (json ->> '$.kind'),
-                pubkey BLOB NOT NULL GENERATED ALWAYS AS (unhex(json ->> '$.pubkey')),
-                created_at INTEGER NOT NULL GENERATED ALWAYS AS (json ->> '$.created_at'),
-                created_at_utc TEXT NOT NULL GENERATED ALWAYS AS (datetime(created_at, 'unixepoch'))
-            ) STRICT
-        "})
-        .execute(&mut conn)
-        .await?;
-
-        debug!("create indexes");
-        sqlx::query(indoc! {"
-            CREATE UNIQUE INDEX event_id ON event(id);
-            CREATE INDEX event_kind ON event(kind, created_at);
-            CREATE INDEX event_created_at ON event(created_at, id);
-            CREATE INDEX event_pubkey ON event(pubkey, created_at);
-            -- Useful for finding the latest profile/follow-list, etc:
-            CREATE INDEX event_pubkey_kind ON event(pubkey, kind, created_at);
-            -- TODO: The same for the 'd' tag for a user.
-        "})
-        .execute(&mut conn)
-        .await?;
-
-        debug!("create view");
-        sqlx::query(indoc! {"
-            -- event_view: a more human-readable version of the events table. (except for raw_id)
-            CREATE VIEW event_view AS
-            SELECT
-                id AS raw_id, -- to easily join w/ events table.
-                (json ->> '$.id') AS id,
-                kind,
-                (json ->> '$.pubkey') AS pubkey,
-                (json ->> '$.sig') AS signature,
-                created_at,
-                created_at_utc,
-                (datetime(created_at, 'unixepoch', 'localtime')) AS created_at_local,
-                json(json) AS json
-            FROM event
-            ORDER BY created_at DESC
-        "})
-        .execute(&mut conn)
-        .await?;
-
+        DB::init(db_file).await?;
         println!("Done.");
-
         Ok(())
     })
 }
