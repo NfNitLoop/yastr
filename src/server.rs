@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{any::Any, net::SocketAddr, sync::Arc};
 
 use axum::{
     extract::{
@@ -15,7 +15,7 @@ use futures::{
     stream::{SplitSink, StreamExt},
     SinkExt as _,
 };
-use nostr::RelayMessage;
+use nostr::{Kind, RelayMessage};
 use tokio::sync::Mutex;
 use tracing::{debug, trace};
 
@@ -205,20 +205,8 @@ impl Connection {
     async fn save_event(self: &Arc<Self>, event: Box<nostr::Event>) {
         // note: MUST send an OK(true/false) response to every event we get.
 
-        // TODO: Check allowed pubkeys. (probably cached?)
-
-        let kind = event.kind();
-        if kind.is_ephemeral() || kind.is_job_request() || kind.is_job_result() {
-            self.send_spawn(RelayMessage::ok(
-                event.id,
-                false,
-                format!("error: Unsupported event kind: {}", event.kind),
-            ));
-            return;
-        }
-
-        if event.verify().is_err() {
-            self.send_spawn(RelayMessage::ok(event.id, false, "Invalid signature"));
+        if let Err(message) = self.check_allowed(&event).await {
+            self.send_spawn(RelayMessage::ok(event.id, false, message));
             return;
         }
 
@@ -237,6 +225,51 @@ impl Connection {
             // This is probably always going to be because we lost a connection:
             trace!("save_event couldn't send response: {res:?}")
         }
+    }
+
+    /// return an error message if the event isn't allowed.
+    async fn check_allowed(&self, event: &nostr::Event) -> Result<(), String> {
+        // Check in optimized order, cheapest checks first.
+
+        // TODO: Allow a server to configure what types it supports.
+        //
+        // Encrypted messages don't have forward secrecy and could be compromised by a later key leak.
+        let allow_encrypted_message = false;
+        let max_clock_drift_secs = 3;
+
+        let kind = event.kind();
+        let unsupported_type = kind.is_ephemeral()
+            || kind.is_job_request()
+            || kind.is_job_result()
+            || (matches!(kind, Kind::EncryptedDirectMessage) && !allow_encrypted_message);
+        if unsupported_type {
+            return Err(format!("blocked: Unsupported event kind: {}", event.kind));
+        }
+
+        // TODO: disallow events in the future.
+
+        if event.verify().is_err() {
+            return Err(format!("invalid: Invalid signature"));
+        }
+
+        // TODO: Caches for these:
+
+        let user_allowed = self
+            .db
+            .user_allowed(&event.pubkey)
+            .await
+            .map_err(|e| format!("error: {e}"))?;
+
+        if !user_allowed {
+            return Err(format!(
+                "blocked: Access not granted for pubkey {}",
+                event.pubkey
+            ));
+        }
+
+        // TODO: allow event IDs that are referred to by other events.
+
+        Ok(())
     }
 
     async fn send(&self, msg: &RelayMessage) -> crate::result::Result<(), ConnectionError> {

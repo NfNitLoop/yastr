@@ -1,6 +1,6 @@
 use futures::StreamExt;
 use indoc::indoc;
-use nostr::JsonUtil;
+use nostr::{JsonUtil, PublicKey};
 use std::{path::Path, str::FromStr, sync::Arc, time::Duration};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::debug;
@@ -338,6 +338,18 @@ impl DB {
                 return;
             }
         }
+    }
+
+    pub(crate) async fn user_allowed(&self, pubkey: &PublicKey) -> Result<bool, sqlx::Error> {
+        let row: (bool,) = sqlx::query_as(indoc! {"
+            SELECT EXISTS (
+                SELECT pubkey from allowed_users where pubkey = ?
+            )"})
+        .bind(pubkey.to_string())
+        .fetch_one(self.pool.as_ref())
+        .await?;
+
+        Ok(row.0)
     }
 }
 
