@@ -7,7 +7,7 @@ use tracing::debug;
 
 use sqlx::{
     sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
-    ConnectOptions as _, Pool, Sqlite,
+    ConnectOptions as _, FromRow, Pool, Sqlite,
 };
 
 /// The interface to our underlying database.
@@ -351,9 +351,49 @@ impl DB {
 
         Ok(row.0)
     }
+
+    /// True iff this event is referred to by one on the server:
+    pub(crate) async fn referred_event(&self, id: &nostr::EventId) -> Result<bool, sqlx::Error> {
+        let row: HasRefRow = sqlx::query_as(indoc! {"
+            SELECT EXISTS (
+                SELECT name from tag where name = 'e' AND value = ?
+            ) AS has_ref
+        "})
+        .bind(id.to_string())
+        .fetch_one(self.pool.as_ref())
+        .await?;
+
+        Ok(row.has_ref)
+    }
+
+    /// True iff this pubkey is referred to by someone on this server.
+    /// Includes if "someone" is by an event that uses this pubkey.
+    pub(crate) async fn referred_pubkey(
+        &self,
+        pubkey: &nostr::PublicKey,
+    ) -> Result<bool, sqlx::Error> {
+        let row: HasRefRow = sqlx::query_as(indoc! {"
+            SELECT EXISTS (
+                SELECT name from tag where name = 'p' AND value = ?
+            ) OR EXISTS (
+                SELECT 1 from event where unhex(pubkey) = ?
+            ) AS has_ref
+        "})
+        .bind(pubkey.to_string())
+        .bind(pubkey.to_bytes().to_vec())
+        .fetch_one(self.pool.as_ref())
+        .await?;
+
+        Ok(row.has_ref)
+    }
 }
 
 #[derive(sqlx::FromRow, Debug)]
 struct JsonRow {
     json: String,
+}
+
+#[derive(FromRow)]
+struct HasRefRow {
+    has_ref: bool,
 }

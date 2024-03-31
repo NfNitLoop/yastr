@@ -1,4 +1,4 @@
-use std::{any::Any, net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     extract::{
@@ -232,44 +232,65 @@ impl Connection {
         // Check in optimized order, cheapest checks first.
 
         // TODO: Allow a server to configure what types it supports.
-        //
-        // Encrypted messages don't have forward secrecy and could be compromised by a later key leak.
-        let allow_encrypted_message = false;
-        let max_clock_drift_secs = 3;
+        let opts = ServerOptions::default();
 
         let kind = event.kind();
         let unsupported_type = kind.is_ephemeral()
             || kind.is_job_request()
             || kind.is_job_result()
-            || (matches!(kind, Kind::EncryptedDirectMessage) && !allow_encrypted_message);
+            || (matches!(kind, Kind::EncryptedDirectMessage) && !opts.allow_encrypted_messages);
         if unsupported_type {
             return Err(format!("blocked: Unsupported event kind: {}", event.kind));
         }
-
-        // TODO: disallow events in the future.
 
         if event.verify().is_err() {
             return Err(format!("invalid: Invalid signature"));
         }
 
-        // TODO: Caches for these:
-
+        // TODO: Cache
         let user_allowed = self
             .db
             .user_allowed(&event.pubkey)
             .await
             .map_err(|e| format!("error: {e}"))?;
 
-        if !user_allowed {
-            return Err(format!(
-                "blocked: Access not granted for pubkey {}",
-                event.pubkey
-            ));
+        if user_allowed {
+            trace!("Granted access based on pubkey: {}", event.pubkey);
+            return Ok(());
         }
 
-        // TODO: allow event IDs that are referred to by other events.
+        // Allow events that are referred to by existing users' events:
+        let has_ref = self
+            .db
+            .referred_event(&event.id)
+            .await
+            .map_err(|e| format!("error: {e}"))?;
 
-        Ok(())
+        if has_ref {
+            trace!("Granted access for referred event: {}", event.id);
+            return Ok(());
+        }
+
+        if matches!(event.kind, Kind::Metadata) {
+            let has_ref = self
+                .db
+                .referred_pubkey(&event.pubkey)
+                .await
+                .map_err(|e| format!("error: {e}"))?;
+            if has_ref {
+                trace!(
+                    "Granted access for referred pubkey profile (kind 0) {}",
+                    event.pubkey
+                );
+                return Ok(());
+            }
+        }
+
+        // Default error message if none of the above exceptions granted access:
+        Err(format!(
+            "blocked: Access not granted for pubkey {}",
+            event.pubkey
+        ))
     }
 
     async fn send(&self, msg: &RelayMessage) -> crate::result::Result<(), ConnectionError> {
@@ -298,6 +319,24 @@ impl Connection {
 
     fn notice(self: &Arc<Self>, msg: impl Into<String>) {
         self.send_spawn(RelayMessage::notice(msg))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ServerOptions {
+    allow_encrypted_messages: bool,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self {
+            // Encrypted messages don't have forward secrecy and could be compromised by a later key leak.
+            allow_encrypted_messages: false,
+            // TODO: check event.serialized_size()
+            // let max_event_bytes = 128 * 1024; // 128 KiB
+            // TODO: disallow events in the future.
+            // let max_clock_drift_secs = 3;
+        }
     }
 }
 
