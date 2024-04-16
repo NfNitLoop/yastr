@@ -37,10 +37,18 @@ pub async fn get_root(
 /// See: <https://github.com/nostr-protocol/nips/blob/master/11.md>
 #[derive(Debug, Serialize)]
 struct RelayInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     supported_nips: Vec<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     software: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limitation: Option<Limitation>,
 }
 
 impl Default for RelayInfo {
@@ -53,6 +61,77 @@ impl Default for RelayInfo {
                 1,
                 // 45 // TODO: COUNT.
             ],
+            limitation: Some(Limitation::default()),
+        }
+    }
+}
+
+/// NIP-11 "limitation" information.
+#[derive(Debug, Serialize)]
+struct Limitation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_message_length: Option<u64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_subscriptions: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_filters: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_limit: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_subid_length: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_event_tags: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_content_length: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_pow_difficulty: Option<u8>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_required: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payment_required: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restricted_writes: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_at_lower_limit: Option<u64>,
+
+    /// Examples seem to be small. I assume this is the amount of seconds into the future we'll accept messages for?
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_at_upper_limit: Option<u64>,
+}
+
+impl Default for Limitation {
+    fn default() -> Self {
+        Self {
+            // ... until we implement more?
+            max_filters: Some(1),
+
+            // 128k ought to be enough for anybody. ;)
+            max_message_length: Some(128 * 1024),
+
+            // A core feature of Yastr is that it's friends-only by default.
+            restricted_writes: Some(true),
+
+            max_subscriptions: None,
+            max_limit: None,
+            max_subid_length: None,
+            max_event_tags: None,
+            max_content_length: None,
+            min_pow_difficulty: None,
+            auth_required: None,
+            payment_required: None,
+            created_at_lower_limit: None,
+            created_at_upper_limit: None,
         }
     }
 }
