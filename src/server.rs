@@ -17,7 +17,7 @@ use futures::{
 };
 use nostr::{Kind, RelayMessage};
 use tokio::sync::Mutex;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 pub async fn get_root(
     ws: Option<WebSocketUpgrade>,
@@ -186,12 +186,15 @@ impl Connection {
     async fn got_message(self: &Arc<Self>, text: String) {
         let msg: nostr::ClientMessage = match serde_json::from_str(&text) {
             Ok(m) => m,
-            Err(_) => {
-                debug!("Message from client was invalid.");
-                self.notice("Your client sent an invalid message.");
+            Err(e) => {
+                let msg = format!("error: Message from client was invalid: {e:#?}");
+                warn!("{msg}");
+                self.notice(msg);
                 return;
             }
         };
+
+        trace!("got message: {msg:?}");
 
         use nostr::ClientMessage::*;
         match msg {
