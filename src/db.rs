@@ -233,6 +233,27 @@ impl DB {
         Ok(())
     }
 
+    pub(crate) async fn get_event(
+        &self,
+        id: nostr::EventId,
+    ) -> Result<Option<nostr::Event>, sqlx::Error> {
+        let filters = vec![nostr::Filter {
+            ids: Some({
+                let mut s = std::collections::HashSet::new();
+                s.insert(id);
+                s
+            }),
+            ..Default::default()
+        }];
+
+        let mut chan = self.search(filters);
+        let Some(result) = chan.recv().await else {
+            return Ok(None);
+        };
+
+        Ok(Some(result?))
+    }
+
     /// Search for events matching the given filters.
     /// Returns a receiver channel onto which the results will be delivered.
     pub(crate) fn search(

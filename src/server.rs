@@ -1,3 +1,5 @@
+pub(crate) mod nip95;
+
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
