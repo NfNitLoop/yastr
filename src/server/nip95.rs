@@ -71,7 +71,7 @@ pub fn router() -> Router<DB> {
 
     let mut html = String::from("<html><head><title>File Metadata</title></head><body>");
 
-    html.push_str(r#"<p>This is a Kind 1095 file as described in (in-progress) <a href="https://github.com/nostr-protocol/nips/pull/345">NIP-95</a>.</p>"#);
+    html.push_str(r#"<p>This is a Kind 1065 file as described in (in-progress) <a href="https://github.com/nostr-protocol/nips/pull/345">NIP-95</a>.</p>"#);
 
     let file_name = meta.file_name()?.unwrap_or_else(|| "unknown".into());
     html.push_str("<p>For your convenience, you may view the file here: <a href=\"file/");
