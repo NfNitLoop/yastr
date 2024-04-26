@@ -25,6 +25,7 @@ pub fn router(db_pool: DB) -> axum::Router {
         .route("/", get(get_root))
         .nest("/files", nip95::router())
         .with_state(db_pool)
+        .layer(tower_http::trace::TraceLayer::new_for_http())
 }
 
 pub async fn get_root(
