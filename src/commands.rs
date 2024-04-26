@@ -1,5 +1,3 @@
-use axum::routing::get;
-
 use std::{net::SocketAddr, path::PathBuf};
 use tracing::debug;
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
@@ -90,16 +88,8 @@ fn serve(opts: ServeCommand) -> Result {
 }
 
 async fn async_serve(opts: ServeCommand) -> Result {
-    // TODO: Move into the server module.
     let db_pool = DB::connect(&opts.global.db_file).await?;
-    let app = axum::Router::new()
-        .route("/", get(server::get_root))
-        .route("/nip95/:event_id", get(server::nip95::info))
-        .route(
-            "/nip95/:event_id/file/:file_name",
-            get(server::nip95::get_file),
-        )
-        .with_state(db_pool);
+    let app = server::router(db_pool);
 
     // todo:
     let bind = "127.0.0.1:8095";

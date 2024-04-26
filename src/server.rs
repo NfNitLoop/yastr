@@ -1,4 +1,5 @@
 pub(crate) mod nip95;
+pub(crate) mod immutable;
 
 use std::{net::SocketAddr, sync::Arc};
 
@@ -6,9 +7,7 @@ use axum::{
     extract::{
         ws::{self, WebSocket},
         ConnectInfo, State, WebSocketUpgrade,
-    },
-    response::IntoResponse,
-    Json,
+    }, response::IntoResponse, routing::get, Json
 };
 use serde::Serialize;
 
@@ -20,6 +19,13 @@ use futures::{
 use nostr::{Kind, RelayMessage};
 use tokio::sync::Mutex;
 use tracing::{debug, trace, warn};
+
+pub fn router(db_pool: DB) -> axum::Router {
+    axum::Router::new()
+        .route("/", get(get_root))
+        .nest("/files", nip95::router())
+        .with_state(db_pool)
+}
 
 pub async fn get_root(
     ws: Option<WebSocketUpgrade>,

@@ -2,6 +2,6 @@
     "rust-analyzer.showUnlinkedFileNotification": false,
     "[rust]": {
         "editor.defaultFormatter": "rust-lang.rust-analyzer",
-        "editor.formatOnSave": true
+        "editor.formatOnSave": false
       },
 }

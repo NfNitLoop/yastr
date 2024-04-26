@@ -4,11 +4,13 @@
 use std::collections::VecDeque;
 
 use axum::{
-    body::Body,
-    extract::{Path, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    body::Body, extract::{Path, State}, 
+    http::{header::{ACCEPT, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE}, HeaderMap, StatusCode},
+    middleware,
+    response::{Html, IntoResponse, Redirect, Response},
+    routing::get,
     Json,
+    Router
 };
 use nostr::event::{EventId, Tag, TagKind};
 
@@ -17,11 +19,23 @@ use tracing::warn;
 
 use crate::db::DB;
 
+use super::immutable::cache_forever;
+
+pub fn router() -> Router<DB> {
+
+    let files = Router::new()
+        .route(
+            "/:event_id/file/:file_name",
+            get(get_file),
+        ).layer(middleware::from_fn(cache_forever));
+
+    Router::new()
+        .route("/:event_id", get(add_slash))
+        .route("/:event_id/", get(get_info))
+        .merge(files)
+}
 /// Given an event_id, load the kind 1065 event to get info about it.
-///
-/// For now I'm being lazy and just spitting out the event JSON, but this could
-/// give HTML or JSON depending on the "accept" headers we get.
-pub async fn info(State(db): State<DB>, Path(event_id): Path<String>) -> Result<Response, String> {
+ pub async fn get_info(headers: HeaderMap, State(db): State<DB>, Path(event_id): Path<String>) -> Result<Response, String> {
     let id = nostr::EventId::parse(event_id).map_err(|e| format!("error: {e:?}"))?;
     let event = db
         .get_event(id)
@@ -38,9 +52,61 @@ pub async fn info(State(db): State<DB>, Path(event_id): Path<String>) -> Result<
 
     // If we wouldn't accept this event, we shouldn't serve it:
     // (Can happen if we got stricter w/ rules after accepting old events.)
-    FileMeta::filter_accept(&event)?;
+    FileMeta::reject(&event)?;
+    let meta = FileMeta::from(&event);
 
-    Ok(Json(event).into_response())
+    let show_html = match headers.get(ACCEPT) {
+        None => false,
+        Some(accept) => {
+            match accept.to_str() {
+                Err(_) => false,
+                Ok(value) => value.contains("text/html")
+            }
+        }
+    };
+
+    if !show_html {
+       return Ok(Json(event).into_response());
+    }
+
+    let mut html = String::from("<html><head><title>File Metadata</title></head><body>");
+
+    html.push_str(r#"<p>This is a Kind 1095 file as described in (in-progress) <a href="https://github.com/nostr-protocol/nips/pull/345">NIP-95</a>.</p>"#);
+
+    let file_name = meta.file_name()?.unwrap_or_else(|| "unknown".into());
+    html.push_str("<p>For your convenience, you may view the file here: <a href=\"file/");
+        html.push_str(&attr_escape(&file_name));
+    html.push_str("\">");
+    html.push_str(&html_escape(&file_name));
+    html.push_str("</a></p>");
+
+
+
+    let json = serde_json::to_string_pretty(&event).unwrap_or_else(|err| format!("Error encoding JSON: {err:#?}"));
+    let json = html_escape(json);
+    html.push_str("<div style='background-color: #ddd; display: inline-block; padding: 1em;'><code><pre>");
+    html.push_str(&json);
+    html.push_str("</pre></code></div>");
+    
+
+    html.push_str("</body></html>");
+
+    Ok(Html(html).into_response())
+    
+
+}
+
+fn html_escape<T: AsRef<str>>(value: T) -> String {
+    value.as_ref().replace("&", "&amp;").replace("<", "&lt;")
+}
+
+fn attr_escape<T: AsRef<str>>(value: T) -> String {
+    value.as_ref().replace("\"", "&quot;")
+}
+
+pub async fn add_slash(Path(event_id): Path<String>) -> Redirect {
+    let dest = format!("{event_id}/");
+    Redirect::to(&dest)
 }
 
 /// Allow downloading the file with simple HTTP.
@@ -63,9 +129,15 @@ pub async fn get_file(
         return Ok(StatusCode::NOT_FOUND.into_response());
     }
 
-    FileMeta::filter_accept(&event)?;
+    FileMeta::reject(&event)?;
 
     let meta = FileMeta { event: &event };
+    let mut headers = HeaderMap::new();
+    let total_size = meta.size()?;
+    headers.insert(CONTENT_LENGTH, total_size.into());
+
+    let mut mime_type: Option<String> = None;
+    // TODO: honor the "m" mimetype tag by default. 
 
     let file_name = meta.file_name()?;
     // Note: Most NIP95 files *don't* have a file name:
@@ -76,7 +148,29 @@ pub async fn get_file(
 
         // TODO: Set mime type headers depending on the file name?
         // Or the mime type in the payload. But this could be dangerous?
+        if mime_type.is_none() {
+            mime_type = guess_mime(&file_name);
+        }
     }
+
+    // Set Content-Type:
+    if let Some(mut mt) = mime_type {
+        if mt.contains("script") {
+            mt = mime_guess::mime::TEXT_PLAIN_UTF_8.to_string();
+        }
+        match mt.try_into() {
+            Err(err) => { warn!("Error converting content-type header: {err:?}"); },
+            Ok(value) => { headers.insert(CONTENT_TYPE, value); },
+        }
+    }
+
+    // TODO: Disallow scripting.
+    // See: https://security.stackexchange.com/questions/148507/how-to-prevent-xss-in-svg-file-upload
+    headers.insert(CONTENT_SECURITY_POLICY, "default-src 'none';".try_into().expect("CSP header"));
+    headers.insert(CACHE_CONTROL, "public, no-transform, max-age=31536000, stale-while-revalidate=31536000, immutable".try_into().expect("cache control header"));
+    // TODO: CORS headers.
+    // TODO: implement content-range requests. https://developer.mozilla.org/en-US/docs/Web/HTTP/Range_requests
+    // TODO: last-modified.
 
     let event_ids = meta
         .event_ids()
@@ -84,13 +178,16 @@ pub async fn get_file(
         .map(|it| it.to_owned())
         .collect::<Vec<_>>();
 
-    let total_size = meta.size()?;
+    let response = (
+        headers,
+        Body::from_stream(stream_bytes(db, event_ids))
+    ).into_response();
 
-    // TODO: mime type, content-length
+    Ok(response)
+}
 
-    let stream = stream_bytes(db, event_ids);
-
-    Ok(Body::from_stream(stream).into_response())
+fn guess_mime(file_name: &str) -> Option<String> {
+    mime_guess::from_path(file_name).first().map(|m| m.to_string())
 }
 
 /// A wrapper around a [`nostr::Event`] with extra functionality to support Kind 1065 file metadata events.
@@ -105,8 +202,8 @@ impl<'a> From<&'a nostr::Event> for FileMeta<'a> {
 }
 
 impl<'a> FileMeta<'a> {
-    /// Returns an error string if we should reject this message.
-    fn filter_accept(event: &nostr::Event) -> Result<(), String> {
+    /// Returns an Err string if we should reject this message.
+    fn reject(event: &nostr::Event) -> Result<(), String> {
         if event.kind.as_u32() != 1065 {
             // We're not checking this kind of event.
             return Ok(());
@@ -121,12 +218,11 @@ impl<'a> FileMeta<'a> {
 
         meta.size()?;
 
+        // Additional requirements for multi-part messages:
         if event_ids.len() > 1 {
             // Multi-part messages MUST include a blockSize, so that clients can know how to
-            // calculate byte offsets before fetching every individual message.
+            // calculate byte offsets w/o having to fetch every individual message.
             meta.block_size()?;
-
-            // Going to enforce some other, stricter requirements for multi-part messages as well:
 
             // If I'm going to store big(er) files for you, at least tell me its name.
             let file_name = meta.file_name()?;
@@ -273,6 +369,7 @@ impl<'a> FileMeta<'a> {
     }
 
     /// Like [`Self::custom_tag`], but return an error if the tag is missing.
+    #[allow(dead_code)]
     fn require_custom_tag(&self, tag_name: &str) -> Result<&Vec<String>, String> {
         let Some(values) = self.custom_tag(tag_name)? else {
             return Err(format!("Required tag {tag_name} is missing"));
