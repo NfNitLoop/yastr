@@ -68,7 +68,9 @@ impl Default for RelayInfo {
             version: Some(env!("CARGO_PKG_VERSION").into()),
             supported_nips: vec![
                 1,
+                11, // serving this metadata document about server capabilities.
                 // 45 // TODO: COUNT.
+                95, // Base64-encoded single & multi-part files.
             ],
             limitation: Some(Limitation::default()),
         }

@@ -274,6 +274,8 @@ impl DB {
     ) {
         let mut query = sqlx::QueryBuilder::new("SELECT json FROM event WHERE true");
 
+        // TODO: Refactor some of the filter logic out so that we can re-use it for COUNT.
+
         if let Some(filter) = filters.first() {
             let nostr::Filter {
                 authors,
@@ -307,8 +309,12 @@ impl DB {
                 query.push_bind(since.as_i64());
             }
 
+            let mut has_ids = false;
+            let mut has_kinds = false;
+
             if let Some(ids) = ids {
                 if !ids.is_empty() {
+                    has_ids = true;
                     let mut query = query.separated(",");
                     query.push_unseparated(" AND unhex(id) IN (");
                     for id in ids {
@@ -320,6 +326,7 @@ impl DB {
 
             if let Some(kinds) = kinds {
                 if !kinds.is_empty() {
+                    has_kinds = true;
                     let mut query = query.separated(",");
                     query.push_unseparated(" AND kind IN (");
                     for kind in kinds {
@@ -327,6 +334,11 @@ impl DB {
                     }
                     query.push_unseparated(")");
                 }
+            }
+
+            if !(has_kinds || has_ids) {
+                // Don't show Kind 1064 (file contents) unless explicitly requested:
+                query.push(" AND kind <> 1064");
             }
 
             let limit = limit.unwrap_or(100) as i64;
