@@ -10,6 +10,8 @@ use sqlx::{
     ConnectOptions as _, FromRow, Pool, Sqlite,
 };
 
+use crate::sqlx_extras::Extras as _;
+
 /// The interface to our underlying database.
 #[derive(Clone)]
 pub(crate) struct DB {
@@ -289,13 +291,8 @@ impl DB {
             } = filter;
             if let Some(authors) = authors {
                 if !authors.is_empty() {
-                    let mut query = query.separated(",");
-                    query.push_unseparated(" AND unhex(pubkey) IN (");
-                    for pubkey in authors {
-                        let key = pubkey.to_bytes().to_vec();
-                        query.push_bind(key);
-                    }
-                    query.push_unseparated(")");
+                    query.push(" AND ");
+                    query.is_in("unhex(pubkey)", authors.iter().map(|it| it.to_bytes().to_vec()));
                 }
             }
             if let Some(until) = until {
@@ -315,24 +312,16 @@ impl DB {
             if let Some(ids) = ids {
                 if !ids.is_empty() {
                     has_ids = true;
-                    let mut query = query.separated(",");
-                    query.push_unseparated(" AND unhex(id) IN (");
-                    for id in ids {
-                        query.push_bind(id.as_bytes().to_vec());
-                    }
-                    query.push_unseparated(")");
+                    query.push(" AND ");
+                    query.is_in("unhex(id)", ids.into_iter().map(|id| id.as_bytes().to_vec()));
                 }
             }
 
             if let Some(kinds) = kinds {
                 if !kinds.is_empty() {
                     has_kinds = true;
-                    let mut query = query.separated(",");
-                    query.push_unseparated(" AND kind IN (");
-                    for kind in kinds {
-                        query.push_bind(kind.as_u64() as i64);
-                    }
-                    query.push_unseparated(")");
+                    query.push(" AND ");
+                    query.is_in("kind", kinds.iter().map(|it| it.as_u64() as i64));
                 }
             }
 
