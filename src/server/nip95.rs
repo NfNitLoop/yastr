@@ -170,7 +170,7 @@ pub async fn get_file(
 
     // Disallow scripting.
     // See: https://security.stackexchange.com/questions/148507/how-to-prevent-xss-in-svg-file-upload
-    headers.insert(CONTENT_SECURITY_POLICY, "default-src 'none';".try_into().expect("CSP header"));
+    headers.insert(CONTENT_SECURITY_POLICY, "default-src: *; script-src 'none';".try_into().expect("CSP header"));
 
     // TODO: CORS headers.
     // TODO: last-modified.
