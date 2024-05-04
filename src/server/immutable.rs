@@ -1,7 +1,7 @@
 //! Implement forever-caching for immutable paths.
 //! See: https://docs.rs/axum/latest/axum/middleware/fn.from_fn.html
 
-use axum::{extract::Request, http::{header::{ETAG, IF_NONE_MATCH}, HeaderMap, StatusCode}, middleware::Next, response::{IntoResponse, Response}};
+use axum::{extract::Request, http::{header::{CACHE_CONTROL, ETAG, IF_NONE_MATCH}, HeaderMap, StatusCode}, middleware::Next, response::{IntoResponse, Response}};
 
 /// note: Only caches forever on 200 responses.
 pub async fn cache_forever(
@@ -17,7 +17,10 @@ pub async fn cache_forever(
 
     let mut response = next.run(request).await;
     if response.status().is_success() {
-        response.headers_mut().insert(ETAG, "\"immutable\"".try_into().expect("etag"));
+        let headers = response.headers_mut();
+        headers.insert(ETAG, "\"immutable\"".try_into().expect("etag"));
+        headers.insert(CACHE_CONTROL, "public, no-transform, max-age=31536000, stale-while-revalidate=31536000, immutable".try_into().expect("cache control header"));
+
     }
     return Ok(response);
 

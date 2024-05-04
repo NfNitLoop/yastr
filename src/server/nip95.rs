@@ -1,21 +1,24 @@
 //! Non-standard extras to support nip95 files.
 //!
 
+mod ranges;
+
 use std::collections::VecDeque;
 
 use axum::{
-    body::Body, extract::{Path, State}, 
-    http::{header::{ACCEPT, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE}, HeaderMap, StatusCode},
+    extract::{Path, State}, 
+    http::{header::{ACCEPT, CONTENT_SECURITY_POLICY, CONTENT_TYPE}, HeaderMap, StatusCode},
     middleware,
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
     Json,
     Router
 };
-use nostr::event::{EventId, Tag, TagKind};
+use axum_extra::{headers::Range, TypedHeader};
+use nostr::event::{Event, EventId, Tag, TagKind};
 
 use futures::{stream, TryStream};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::db::DB;
 
@@ -110,10 +113,10 @@ pub async fn add_slash(Path(event_id): Path<String>) -> Redirect {
 }
 
 /// Allow downloading the file with simple HTTP.
-/// TODO: Support range requests: https://developer.mozilla.org/en-US/docs/Web/HTTP/Range_requests
 pub async fn get_file(
     State(db): State<DB>,
     Path((event_id, req_file_name)): Path<(String, String)>,
+    range: Option<TypedHeader<Range>>,
 ) -> Result<Response, String> {
     let id = nostr::EventId::parse(event_id).map_err(|e| format!("error: {e:?}"))?;
     let event = db
@@ -132,22 +135,23 @@ pub async fn get_file(
     FileMeta::reject(&event)?;
 
     let meta = FileMeta { event: &event };
+
     let mut headers = HeaderMap::new();
     let total_size = meta.size()?;
-    headers.insert(CONTENT_LENGTH, total_size.into());
+    // TODO: Confirm that axum_range handles this.
+    // headers.insert(CONTENT_LENGTH, total_size.into());
 
     let mut mime_type: Option<String> = None;
     // TODO: honor the "m" mimetype tag by default. 
 
     let file_name = meta.file_name()?;
     // Note: Most NIP95 files *don't* have a file name:
-    if let Some(file_name) = file_name {
-        if file_name != req_file_name {
+    if let Some(file_name) = &file_name {
+        if *file_name != req_file_name {
             return Ok(StatusCode::NOT_FOUND.into_response());
         }
 
-        // TODO: Set mime type headers depending on the file name?
-        // Or the mime type in the payload. But this could be dangerous?
+        // Set mime type headers depending on the file name?
         if mime_type.is_none() {
             mime_type = guess_mime(&file_name);
         }
@@ -164,12 +168,11 @@ pub async fn get_file(
         }
     }
 
-    // TODO: Disallow scripting.
+    // Disallow scripting.
     // See: https://security.stackexchange.com/questions/148507/how-to-prevent-xss-in-svg-file-upload
     headers.insert(CONTENT_SECURITY_POLICY, "default-src 'none';".try_into().expect("CSP header"));
-    headers.insert(CACHE_CONTROL, "public, no-transform, max-age=31536000, stale-while-revalidate=31536000, immutable".try_into().expect("cache control header"));
+
     // TODO: CORS headers.
-    // TODO: implement content-range requests. https://developer.mozilla.org/en-US/docs/Web/HTTP/Range_requests
     // TODO: last-modified.
 
     let event_ids = meta
@@ -178,12 +181,24 @@ pub async fn get_file(
         .map(|it| it.to_owned())
         .collect::<Vec<_>>();
 
+    let range = range.map(|TypedHeader(r)| r);
+    if let Some(range) = &range {
+        debug!("Range request for {file_name:?}, {range:?}");
+    }
+    let body = ranges::MultipartRange::new(ranges::MultipartRangeInit {
+        block_size: meta.block_size()?.unwrap_or(u64::MAX),
+        db,
+        event_ids,
+        total_size,
+    });
+
     let response = (
         headers,
-        Body::from_stream(stream_bytes(db, event_ids))
-    ).into_response();
+        // Body::from_stream(stream_bytes(db, event_ids))
+        axum_range::Ranged::new(range, body)
+    );
 
-    Ok(response)
+    Ok(response.into_response())
 }
 
 fn guess_mime(file_name: &str) -> Option<String> {
@@ -203,6 +218,7 @@ impl<'a> From<&'a nostr::Event> for FileMeta<'a> {
 
 impl<'a> FileMeta<'a> {
     /// Returns an Err string if we should reject this message.
+    // TODO: Better error type here.
     fn reject(event: &nostr::Event) -> Result<(), String> {
         if event.kind.as_u32() != 1065 {
             // We're not checking this kind of event.
@@ -300,16 +316,6 @@ impl<'a> FileMeta<'a> {
             .map_err(|e| format!("Error parsing size: {e}"))?;
 
         Ok(size)
-
-        // let tag_name = "size";
-        // let values = self.require_custom_tag("size")?;
-        // let Some(value) = values.into_iter().next() else {
-        //     return Err(format!("No value for tag {tag_name}"));
-        // };
-        // let value = value
-        //     .parse::<u64>()
-        //     .map_err(|e| format!("Error parsing value for tag {tag_name}: {e:?}"))?;
-        // Ok(value)
     }
 
     pub fn block_size(&self) -> Result<Option<u64>, String> {
@@ -378,6 +384,7 @@ impl<'a> FileMeta<'a> {
     }
 }
 
+/// Lazily stream multi-part file upload bytes
 fn stream_bytes(db: DB, event_ids: Vec<EventId>) -> impl TryStream<Ok = Vec<u8>, Error = String> {
     struct State {
         event_ids: VecDeque<EventId>,
@@ -403,15 +410,16 @@ fn stream_bytes(db: DB, event_ids: Vec<EventId>) -> impl TryStream<Ok = Vec<u8>,
             return Err(format!("no such event: {event_id}"));
         };
 
-        use base64::prelude::BASE64_STANDARD as b64;
-        use base64::Engine as _;
-        let bytes = b64
-            .decode(event.content.as_str())
+
+        let bytes = get_bytes(&event)
             .map_err(|e| format!("Error decoding base64 content: {e:?}"))?;
 
         Ok(Some((bytes, state)))
     })
 }
 
-// TODO: maybe use stream.unfold to make a stream: https://docs.rs/futures/latest/futures/stream/fn.unfold.html
-// Then you can make a Body from it: https://docs.rs/axum/latest/axum/body/struct.Body.html#method.from_streamq
+fn get_bytes(event: &Event) -> Result<Vec<u8>, base64::DecodeError> {
+    use base64::prelude::BASE64_STANDARD as b64;
+    use base64::Engine as _;
+    b64.decode(event.content.as_str())
+}
