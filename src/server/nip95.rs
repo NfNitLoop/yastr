@@ -3,8 +3,6 @@
 
 mod ranges;
 
-use std::collections::VecDeque;
-
 use axum::{
     extract::{Path, State}, 
     http::{header::{ACCEPT, CONTENT_SECURITY_POLICY, CONTENT_TYPE}, HeaderMap, StatusCode},
@@ -17,7 +15,6 @@ use axum::{
 use axum_extra::{headers::Range, TypedHeader};
 use nostr::event::{Event, EventId, Tag, TagKind};
 
-use futures::{stream, TryStream};
 use tracing::{debug, warn};
 
 use crate::db::DB;
@@ -382,40 +379,6 @@ impl<'a> FileMeta<'a> {
         };
         Ok(values)
     }
-}
-
-/// Lazily stream multi-part file upload bytes
-fn stream_bytes(db: DB, event_ids: Vec<EventId>) -> impl TryStream<Ok = Vec<u8>, Error = String> {
-    struct State {
-        event_ids: VecDeque<EventId>,
-        db: DB,
-    }
-
-    let state = State {
-        event_ids: VecDeque::from(event_ids),
-        db,
-    };
-
-    stream::try_unfold(state, |mut state| async move {
-        let Some(event_id) = state.event_ids.pop_front() else {
-            return Ok(None);
-        };
-
-        let event = state
-            .db
-            .get_event(event_id)
-            .await
-            .map_err(|e| format!("error: {e:?}"))?;
-        let Some(event) = event else {
-            return Err(format!("no such event: {event_id}"));
-        };
-
-
-        let bytes = get_bytes(&event)
-            .map_err(|e| format!("Error decoding base64 content: {e:?}"))?;
-
-        Ok(Some((bytes, state)))
-    })
 }
 
 fn get_bytes(event: &Event) -> Result<Vec<u8>, base64::DecodeError> {
