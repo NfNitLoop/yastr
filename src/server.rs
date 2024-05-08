@@ -68,8 +68,8 @@ impl Default for RelayInfo {
             version: Some(env!("CARGO_PKG_VERSION").into()),
             supported_nips: vec![
                 1,
-                11, // serving this metadata document about server capabilities.
-                // 45 // TODO: COUNT.
+                11, // serving this JSON metadata about server capabilities.
+                45, // COUNT.
                 95, // Base64-encoded single & multi-part files.
             ],
             limitation: Some(Limitation::default()),
@@ -209,7 +209,7 @@ impl Connection {
 
         use nostr::ClientMessage::*;
         match msg {
-            Auth(_) | Count { .. } | NegClose { .. } | NegOpen { .. } | NegMsg { .. } => {
+            Auth(_) | NegClose { .. } | NegOpen { .. } | NegMsg { .. } => {
                 debug!("Unsupported message");
             }
             Event(event) => {
@@ -225,6 +225,13 @@ impl Connection {
                     conn.handle_search(subscription_id, filters).await;
                 });
             }
+            Count{subscription_id, filters} => {
+                let conn = Arc::clone(self);
+                tokio::spawn(async move {
+                    conn.handle_count(subscription_id, filters).await;
+                });
+            }
+
             Close(sub_id) => self.close_sub(sub_id),
         }
     }
@@ -293,6 +300,26 @@ impl Connection {
                 trace!("Couldn't send event. Client closed connection?")
             }
         }
+    }
+
+    /// See: <https://github.com/nostr-protocol/nips/blob/master/45.md>
+    async fn handle_count(
+        self: &Arc<Self>,
+        subscription_id: nostr::SubscriptionId,
+        filters: Vec<nostr::Filter>,
+    ) {
+        // We must always close the send either a COUNT or a CLOSE event.
+        
+        let count = match self.db.count(filters).await {
+            Ok(count) => count,
+            Err(err) => {
+                let message = format!("Error from DB: {err}");
+                self.send_spawn(RelayMessage::Closed { subscription_id, message });
+                return;
+            }
+        };
+
+        self.send_spawn(RelayMessage::count(subscription_id, count as usize))
     }
 
     async fn save_event(self: &Arc<Self>, event: Box<nostr::Event>) {

@@ -6,8 +6,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::debug;
 
 use sqlx::{
-    sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
-    ConnectOptions as _, FromRow, Pool, Sqlite,
+    sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions}, ConnectOptions as _, FromRow, Pool, QueryBuilder, Sqlite
 };
 
 use crate::sqlx_extras::Extras as _;
@@ -17,6 +16,8 @@ use crate::sqlx_extras::Extras as _;
 pub(crate) struct DB {
     pool: Arc<Pool<Sqlite>>,
 }
+
+type DbResult<T> = Result<T, sqlx::Error>;
 
 impl DB {
     pub async fn init(db_file: &str) -> Result<(), sqlx::Error> {
@@ -275,65 +276,7 @@ impl DB {
         sender: Sender<Result<nostr::Event, sqlx::Error>>,
     ) {
         let mut query = sqlx::QueryBuilder::new("SELECT json FROM event WHERE true");
-
-        // TODO: Refactor some of the filter logic out so that we can re-use it for COUNT.
-
-        if let Some(filter) = filters.first() {
-            let nostr::Filter {
-                authors,
-                generic_tags: _, // TODO
-                ids,
-                kinds,
-                limit,
-                search: _,
-                since,
-                until,
-            } = filter;
-            if let Some(authors) = authors {
-                if !authors.is_empty() {
-                    query.push(" AND ");
-                    query.is_in("unhex(pubkey)", authors.iter().map(|it| it.to_bytes().to_vec()));
-                }
-            }
-            if let Some(until) = until {
-                // Note: NIP-1 docs this as non-inclusive.
-                // I've seen other nips use since <= event <= until, but that seems wrong.
-                query.push(" AND created_at < ");
-                query.push_bind(until.as_i64());
-            }
-            if let Some(since) = since {
-                query.push(" AND created_at >= ");
-                query.push_bind(since.as_i64());
-            }
-
-            let mut has_ids = false;
-            let mut has_kinds = false;
-
-            if let Some(ids) = ids {
-                if !ids.is_empty() {
-                    has_ids = true;
-                    query.push(" AND ");
-                    query.is_in("unhex(id)", ids.into_iter().map(|id| id.as_bytes().to_vec()));
-                }
-            }
-
-            if let Some(kinds) = kinds {
-                if !kinds.is_empty() {
-                    has_kinds = true;
-                    query.push(" AND ");
-                    query.is_in("kind", kinds.iter().map(|it| it.as_u64() as i64));
-                }
-            }
-
-            if !(has_kinds || has_ids) {
-                // Don't show Kind 1064 (file contents) unless explicitly requested:
-                query.push(" AND kind <> 1064");
-            }
-
-            let limit = limit.unwrap_or(100) as i64;
-            query.push(" LIMIT ");
-            query.push_bind(limit);
-        }
+        filter_to_sql(&mut query, filters);
 
         let mut stream = query.build_query_as().fetch(self.pool.as_ref());
         while let Some(row) = stream.next().await {
@@ -362,7 +305,16 @@ impl DB {
         }
     }
 
-    pub(crate) async fn user_allowed(&self, pubkey: &PublicKey) -> Result<bool, sqlx::Error> {
+    /// Count the events matching some filters.
+    pub async fn count(&self, filters: Vec<nostr::Filter>) -> DbResult<u64> {
+        let mut query = QueryBuilder::new("SELECT COUNT(*) FROM event WHERE true");
+        filter_to_sql(&mut query, filters);
+        let (count,): (i64,) = query.build_query_as().fetch_one(self.pool.as_ref()).await?;
+
+        Ok(count as u64)
+    }
+
+    pub(crate) async fn user_allowed(&self, pubkey: &PublicKey) -> DbResult<bool> {
         let row: (bool,) = sqlx::query_as(indoc! {"
             SELECT EXISTS (
                 SELECT pubkey from allowed_users where pubkey = ?
@@ -375,7 +327,7 @@ impl DB {
     }
 
     /// True iff this event is referred to by one on the server:
-    pub(crate) async fn referred_event(&self, id: &nostr::EventId) -> Result<bool, sqlx::Error> {
+    pub(crate) async fn referred_event(&self, id: &nostr::EventId) -> DbResult<bool> {
         let row: HasRefRow = sqlx::query_as(indoc! {"
             SELECT EXISTS (
                 SELECT name from tag where name = 'e' AND value = ?
@@ -407,6 +359,70 @@ impl DB {
         .await?;
 
         Ok(row.has_ref)
+    }
+}
+
+/// Shared logic for selecting events or counts of events.
+fn filter_to_sql(query: &mut sqlx::QueryBuilder<'_, Sqlite>, filters: Vec<nostr::types::Filter>,) {
+    if let Some(filter) = filters.first() {
+        let nostr::Filter {
+            authors,
+            generic_tags: _, // TODO
+            ids,
+            kinds,
+            limit,
+            search: _,
+            since,
+            until,
+        } = filter;
+        if let Some(authors) = authors {
+            if !authors.is_empty() {
+                query.push(" AND ");
+                query.is_in("unhex(pubkey)", authors.iter().map(|it| it.to_bytes().to_vec()));
+            }
+        }
+        if let Some(until) = until {
+            // Note: NIP-1 docs this as non-inclusive.
+            // I've seen other nips use since <= event <= until, but that seems wrong.
+            query.push(" AND created_at < ");
+            query.push_bind(until.as_i64());
+        }
+        if let Some(since) = since {
+            query.push(" AND created_at >= ");
+            query.push_bind(since.as_i64());
+        }
+
+        let mut has_ids = false;
+        let mut has_kinds = false;
+
+        if let Some(ids) = ids {
+            if !ids.is_empty() {
+                has_ids = true;
+                query.push(" AND ");
+                query.is_in("unhex(id)", ids.into_iter().map(|id| id.as_bytes().to_vec()));
+            }
+        }
+
+        if let Some(kinds) = kinds {
+            if !kinds.is_empty() {
+                has_kinds = true;
+                query.push(" AND ");
+                query.is_in("kind", kinds.iter().map(|it| it.as_u64() as i64));
+            }
+        }
+
+        if !(has_kinds || has_ids) {
+            // Don't show Kind 1064 (file contents) unless explicitly requested:
+            query.push(" AND kind <> 1064");
+        }
+
+        // Since we always have a limit (below), we should make sure to strictly order by created_at so that 
+        // clients can resume a query if they want.
+        query.push(" ORDER BY created_at DESC");
+
+        let limit = limit.unwrap_or(100) as i64;
+        query.push(" LIMIT ");
+        query.push_bind(limit);
     }
 }
 
