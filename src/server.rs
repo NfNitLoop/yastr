@@ -259,9 +259,17 @@ impl Connection {
         subscription_id: nostr::SubscriptionId,
         filters: Vec<nostr::Filter>,
     ) {
-        // We must always close the send EOSE and CLOSE events.
+        // We MUST always close the send EOSE and CLOSE events.
         // So, we do that below, and delegate the rest to the inner function.
-        self.handle_search_inner(&subscription_id, filters).await;
+        let result = self.handle_search_inner(&subscription_id, filters).await;
+
+        if let Err(err) = result {
+            if err.is_closed() { return } // can't return an error.
+            
+            let message = format!("error: {err}");
+            self.send_spawn(RelayMessage::closed(subscription_id, message));
+            return
+        }
 
         let res = self
             .send(&RelayMessage::EndOfStoredEvents(subscription_id.clone()))
@@ -283,33 +291,25 @@ impl Connection {
         self: &Arc<Self>,
         subscription_id: &nostr::SubscriptionId,
         filters: Vec<nostr::Filter>,
-    ) {
+    ) -> Result<(), SearchError> {
         if filters.len() > 1 {
             debug!("got {} filters from client, unsupported.", filters.len());
-            self.notice(
-                "TODO: support multiple filters. Until then, please use separate subscriptions.",
-            );
-            return;
+            return Err(SearchError::TooManyFilters{ received: filters.len(), supported: 1});
         }
 
         let mut events = self.db.search(filters);
 
         while let Some(event) = events.recv().await {
-            let event = match event {
-                Err(err) => {
-                    debug!("Database error: {err:?}");
-                    return;
-                }
-                Ok(e) => e,
-            };
-
+            let event = event?;
             let res = self
                 .send(&RelayMessage::event(subscription_id.clone(), event))
                 .await;
             if res.is_err() {
-                trace!("Couldn't send event. Client closed connection?")
+                return Err(SearchError::ConnectionClosed)
             }
         }
+
+        Ok(())
     }
 
     /// See: <https://github.com/nostr-protocol/nips/blob/master/45.md>
@@ -464,6 +464,24 @@ impl Default for ServerOptions {
             // TODO: disallow events in the future.
             // let max_clock_drift_secs = 3;
         }
+    }
+}
+
+#[derive(thiserror::Error, Debug)]
+enum SearchError {
+    #[error("Received {received} filters but only {supported} supported.")]
+    TooManyFilters{ received: usize, supported: usize},
+
+    #[error("Database error: {0:?}")]
+    DatabaseError(#[from] sqlx::Error),
+
+    #[error("The WebSocket connection is closed, no more responses can be delivered.")]
+    ConnectionClosed,
+}
+
+impl SearchError {
+    fn is_closed(&self) -> bool {
+        matches!(self, SearchError::ConnectionClosed)
     }
 }
 
