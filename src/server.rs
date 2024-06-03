@@ -440,10 +440,7 @@ impl Connection {
     fn send_spawn(self: &Arc<Self>, msg: RelayMessage) {
         let conn = Arc::clone(self);
         tokio::spawn(async move {
-            let res = conn.send(&msg).await;
-            if !res.is_ok() {
-                debug!("Error sending message: {msg:?}");
-            }
+            let _res = conn.send(&msg).await;
         });
     }
 
