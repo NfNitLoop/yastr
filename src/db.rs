@@ -382,9 +382,9 @@ fn filter_to_sql(query: &mut sqlx::QueryBuilder<'_, Sqlite>, filters: Vec<nostr:
             }
         }
         if let Some(until) = until {
-            // Note: NIP-1 docs this as non-inclusive.
-            // I've seen other nips use since <= event <= until, but that seems wrong.
-            query.push(" AND created_at < ");
+            // Note: NIP-1 docs this as inclusive.
+            // ... At least, once this gets merged: https://github.com/nostr-protocol/nips/pull/1284
+            query.push(" AND created_at <= ");
             query.push_bind(until.as_i64());
         }
         if let Some(since) = since {
