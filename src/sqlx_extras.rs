@@ -3,7 +3,8 @@
 pub (crate) trait Extras<'q, DB: sqlx::Database> {
 
     /// Add an in clause.
-    /// Collapses the case where the  iterator is empty to "false" instead of invalid SQL.
+    /// 
+    /// Note: Collapses the case where the  iterator is empty to "false" instead of invalid SQL.
     fn is_in<SqlItem>(&mut self, expression: impl AsRef<str>, items: impl IntoIterator<Item = SqlItem>)
     where SqlItem: 'q + sqlx::Encode<'q, DB> + Send + sqlx::Type<DB>;
 }

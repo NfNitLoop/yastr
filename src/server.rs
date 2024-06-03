@@ -1,4 +1,5 @@
 pub(crate) mod nip95;
+pub(crate) mod nip1;
 pub(crate) mod immutable;
 
 use std::{net::SocketAddr, sync::Arc};
@@ -16,7 +17,7 @@ use futures::{
     stream::{SplitSink, StreamExt},
     SinkExt as _,
 };
-use nostr::{Kind, RelayMessage};
+use nostr::{message::SubscriptionId, Kind, RelayMessage};
 use tokio::sync::Mutex;
 use tracing::{debug, trace, warn};
 
@@ -195,14 +196,23 @@ impl Connection {
     }
 
     async fn got_message(self: &Arc<Self>, text: String) {
-        let msg: nostr::ClientMessage = match serde_json::from_str(&text) {
-            Ok(m) => m,
-            Err(e) => {
-                let msg = format!("error: Message from client was invalid: {e:#?}");
-                warn!("{msg}");
+        use nip1::ParsedEvent as Parsed;
+
+        let msg = match nip1::parse_client_message(&text) {
+            Parsed::Message(m) => m,
+            Parsed::InvalidRequest { subscription_id, error_message } => {
+                let msg = format!("error: {error_message}");
+                warn!(msg);
+                self.send_spawn(RelayMessage::closed(SubscriptionId::new(subscription_id), msg));
+                return
+            },
+            Parsed::Err { message } => {
+                // Couldn't parse the message at all. A notice is the best we can do AFAIK:
+                let msg = format!("error: {message}");
+                warn!(msg);
                 self.notice(msg);
                 return;
-            }
+            },
         };
 
         trace!("got message: {msg:?}");
